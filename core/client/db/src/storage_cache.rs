@@ -779,8 +779,10 @@ mod tests {
 }
 
 #[cfg(test)]
-mod quickcheck {
+mod qc {
 	use std::collections::{HashMap, hash_map::Entry};
+
+    use quickcheck::{quickcheck, TestResult, Arbitrary};
 
 	use super::*;
 	use sr_primitives::testing::{H256, Block as RawBlock, ExtrinsicWrapper};
@@ -793,10 +795,55 @@ mod quickcheck {
 
 	type KeyMap = HashMap<Vec<u8>, Option<Vec<u8>>>;
 
+	#[derive(Debug, Clone)]
 	enum Action {
 		Next { hash: H256, changes: KeySet },
 		Fork { depth: usize, hash: H256, changes: KeySet },
 		Reorg { depth: usize, hash: H256 },
+	}
+
+	impl Arbitrary for Action {
+    	fn arbitrary<G: quickcheck::Gen>(gen: &mut G) -> Self {
+			let path = gen.next_u32() as u8;
+			let mut buf = [0u8; 32];
+
+			match path {
+				0..=200 => {
+					gen.fill_bytes(&mut buf[..]);
+					Action::Next {
+						hash: H256::from(&buf),
+						changes: {
+							let mut set = Vec::new();
+							for _ in 0..gen.next_u32()/(16*256*256*256) {
+								set.push((vec![gen.next_u32() as u8], Some(vec![gen.next_u32() as u8])));
+							}
+							set
+						}
+					}
+				},
+				200..=250 => {
+					gen.fill_bytes(&mut buf[..]);
+					Action::Fork {
+						hash: H256::from(&buf),
+						depth: ((gen.next_u32() as u8) / 64) as usize,
+						changes: {
+							let mut set = Vec::new();
+							for _ in 0..gen.next_u32()/(4*256*256*256) {
+								set.push((vec![gen.next_u32() as u8], Some(vec![gen.next_u32() as u8])));
+							}
+							set
+						}
+					}
+				}
+				_ => {
+					gen.fill_bytes(&mut buf[..]);
+					Action::Reorg {
+						hash: H256::from(&buf),
+						depth: ((gen.next_u32() as u8) / 64) as usize,
+					}
+				}
+			}
+		}
 	}
 
 	struct Mutator {
@@ -807,8 +854,6 @@ mod quickcheck {
 
 	impl Mutator {
 		fn new_empty() -> Self {
-			let root_parent = H256::from(&[0u8; 32]);
-
 			let shared = new_shared_cache::<Block, Blake2Hasher>(256*1024, (0,1));
 
 			Self {
@@ -826,8 +871,20 @@ mod quickcheck {
 			)
 		}
 
+		fn canon_head_state(&self) -> CachingState<Blake2Hasher, InMemory<Blake2Hasher>, Block> {
+			self.head_state(self.canon.last().expect("Expected to be one commit").0)
+		}
+
+		fn head_storage(&self) -> &KeyMap {
+			&self.canon.last().expect("Expected to be one commit").2
+		}
+
 		fn mutate_static(&mut self, action: Action) -> CachingState<Blake2Hasher, InMemory<Blake2Hasher>, Block> {
 			self.mutate(action).expect("Expected to provide only valid actions to the mutate_static")
+		}
+
+		fn canon_len(&self) -> usize {
+			return self.canon.len();
 		}
 
 		fn mutate(&mut self, action: Action) -> Result<CachingState<Blake2Hasher, InMemory<Blake2Hasher>, Block>, ()> {
@@ -1010,5 +1067,38 @@ mod quickcheck {
 
 		mutator.mutate_static(Action::Reorg { depth: 3, hash: h3b });
 		assert!(mutator.head_state(h3a).storage(&key).unwrap().is_none());
+	}
+
+	fn is_head_match(mutator: &Mutator) -> bool {
+		let head_state = mutator.canon_head_state();
+		for (key, val) in mutator.head_storage().iter() {
+			if head_state.storage(key).unwrap() != *val {
+				return false;
+			}
+		}
+		true
+	}
+
+	#[test]
+	fn retract() {
+
+	}
+
+	quickcheck! {
+		fn head_complete(actions: Vec<Action>) -> TestResult {
+			let mut mutator = Mutator::new_empty();
+
+			for action in actions.into_iter() {
+				if let Err(_) = mutator.mutate(action) {
+					return TestResult::discard();
+				}
+			}
+
+			if mutator.canon_len() == 0 {
+				return TestResult::discard();
+			}
+
+			TestResult::from_bool(is_head_match(&mutator))
+		}
 	}
 }
